@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Config (contains secrets)
+config.yaml
+
+# Model weights and checkpoints
+models/
+gguf/
+*.gguf
+*.bin
+*.safetensors
+
+# Data (may contain sensitive content)
+data/processed/
+
+# llama.cpp build artefacts
+llama.cpp/build/
+
+# Environment
+.env
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# TensorBoard
+runs/

@@ -1,0 +1,5 @@
+{"prompt": "What is machine learning?", "response": "Machine learning is a branch of artificial intelligence where systems learn from data to improve their performance on tasks without being explicitly programmed."}
+{"prompt": "Explain the difference between supervised and unsupervised learning.", "response": "Supervised learning uses labelled data where the correct output is provided for each input, while unsupervised learning finds patterns in data without predefined labels."}
+{"prompt": "What is a neural network?", "response": "A neural network is a computational model inspired by the human brain, consisting of layers of interconnected nodes that process information and learn representations from data."}
+{"prompt": "What is overfitting?", "response": "Overfitting occurs when a model learns the training data too well, including its noise, causing it to perform poorly on unseen data."}
+{"prompt": "What is a transformer model?", "response": "A transformer is a deep learning architecture that uses self-attention mechanisms to process sequences in parallel, forming the backbone of modern large language models."}

@@ -1,0 +1,14 @@
+torch>=2.2.0
+transformers>=4.40.0
+datasets>=2.18.0
+peft>=0.10.0
+trl>=0.8.0
+bitsandbytes>=0.43.0
+accelerate>=0.28.0
+sentencepiece
+huggingface_hub
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pyyaml>=6.0
+typer>=0.12.0
+rich>=13.7.0

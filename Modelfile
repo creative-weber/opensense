@@ -1,0 +1,10 @@
+FROM ./gguf/my-custom-model-Q4_K_M.gguf
+
+SYSTEM """
+You are a helpful assistant. Answer clearly and concisely.
+"""
+
+PARAMETER temperature 0.7
+PARAMETER top_p 0.9
+PARAMETER num_ctx 4096
+PARAMETER stop "<|eot_id|>"

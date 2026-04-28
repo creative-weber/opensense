@@ -1,0 +1,28 @@
+model:
+  base: "meta-llama/Meta-Llama-3-8B-Instruct"   # HuggingFace model ID
+  name: "my-custom-model"
+  quant: "Q4_K_M"                                 # Q2_K | Q4_K_M | Q5_K_M | Q8_0
+
+training:
+  epochs: 3
+  batch_size: 4
+  learning_rate: 2e-4
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  max_seq_length: 2048
+  device_map: "auto"                              # "auto" | "cpu" | "cuda"
+
+paths:
+  data_raw: "data/raw"
+  data_processed: "data/processed"
+  base_model: "models/base"
+  fine_tuned: "models/fine_tuned"
+  gguf_out: "gguf"
+
+api:
+  backend: "ollama"                               # "ollama" | "llamacpp"
+  ollama_url: "http://localhost:11434"
+  llamacpp_url: "http://localhost:8080"
+  model_name: "my-custom-model"
+  api_key: ""                                     # leave empty to disable auth
