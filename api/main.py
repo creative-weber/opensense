@@ -1,7 +1,18 @@
 """
 api/main.py — FastAPI wrapper around Ollama or llama.cpp HTTP server.
+
+Memory recall behaviour
+-----------------------
+Warm (recently-accessed) facts are searched first.  If warm results are
+insufficient (fewer than top_k facts above min_score), the cold store is
+searched as well.  Cold recall incurs a configurable async delay
+(cold_recall_delay_seconds) to simulate the slower recognition humans
+experience when recalling something they haven't thought about in months.
+Cold memories that are successfully recalled are automatically restored to
+warm storage.
 """
 
+import asyncio
 import os
 from typing import AsyncGenerator
 
@@ -35,6 +46,12 @@ MEMORY_MIN_SCORE = float(_mem_cfg.get("min_score", 0.45))
 MEMORY_MODEL_CHECK = _mem_cfg.get("model_check", True)
 MEMORY_MIN_CONFIDENCE = float(_mem_cfg.get("min_confidence", 0.6))
 
+# Cold-tier config
+DUMP_AFTER_DAYS = int(_mem_cfg.get("dump_after_days", 180))
+RECENCY_HALF_LIFE_DAYS = int(_mem_cfg.get("recency_half_life_days", 30))
+COLD_SCORE_PENALTY = float(_mem_cfg.get("cold_score_penalty", 0.6))
+COLD_RECALL_DELAY = float(_mem_cfg.get("cold_recall_delay_seconds", 3.0))
+
 app = FastAPI(title="opensense API", version="0.1.0")
 
 _memory: MemoryStore | None = None
@@ -44,7 +61,12 @@ _memory: MemoryStore | None = None
 async def _startup():
     global _memory
     if MEMORY_ENABLED:
-        _memory = MemoryStore(persist_dir=MEMORY_DIR)
+        _memory = MemoryStore(
+            persist_dir=MEMORY_DIR,
+            dump_after_days=DUMP_AFTER_DAYS,
+            recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
+            cold_score_penalty=COLD_SCORE_PENALTY,
+        )
 
 
 def _check_auth(request: Request):
@@ -61,7 +83,9 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
-    memory_hits: list[str] = []  # facts injected from memory (for transparency)
+    memory_hits: list[str] = []        # warm facts injected (for transparency)
+    cold_memory_hits: list[str] = []   # cold facts recalled after delay (for transparency)
+    cold_recall_delay_applied: bool = False
 
 
 class LearnRequest(BaseModel):
@@ -82,6 +106,12 @@ class MemoryListResponse(BaseModel):
     facts: list[dict]
 
 
+class MemoryDumpResponse(BaseModel):
+    dumped: int          # facts moved to cold this run
+    warm_remaining: int  # facts still in warm storage
+    cold_total: int      # total facts now in cold storage
+
+
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
@@ -97,11 +127,52 @@ def _build_prompt(message: str, memory_facts: list[str]) -> str:
     )
 
 
-def _retrieve_memory_facts(query: str) -> list[str]:
+async def _retrieve_memory_facts(
+    query: str,
+) -> tuple[list[str], list[str], bool]:
+    """
+    Two-tier memory retrieval.
+
+    1. Search warm (fast, recency-weighted).
+    2. If warm results are fewer than top_k, search cold after applying a
+       delay (cold_recall_delay_seconds) to simulate slow recall.
+    3. Cold memories that are recalled are automatically restored to warm.
+
+    Returns
+    -------
+    warm_texts : list[str]
+        Texts from warm memory that passed the score threshold.
+    cold_texts : list[str]
+        Texts recalled from cold memory (after delay) that passed threshold.
+    cold_delay_applied : bool
+        True if the cold store was consulted and the delay was incurred.
+    """
     if _memory is None:
-        return []
-    hits = _memory.search(query, top_k=MEMORY_TOP_K)
-    return [h["text"] for h in hits if h["score"] >= MEMORY_MIN_SCORE]
+        return [], [], False
+
+    # --- Warm tier ---
+    warm_hits = _memory.search(query, top_k=MEMORY_TOP_K)
+    good_warm = [h for h in warm_hits if h["score"] >= MEMORY_MIN_SCORE]
+
+    # --- Cold tier (only if warm results are insufficient) ---
+    cold_texts: list[str] = []
+    cold_delay_applied = False
+    cold_needed = MEMORY_TOP_K - len(good_warm)
+
+    if cold_needed > 0 and _memory.count_cold() > 0:
+        # Simulate slow recall — this is the "slower than main memory" penalty
+        await asyncio.sleep(COLD_RECALL_DELAY)
+        cold_delay_applied = True
+
+        cold_hits = _memory.search_cold(query, top_k=cold_needed)
+        for hit in cold_hits:
+            if hit["score"] >= MEMORY_MIN_SCORE:
+                cold_texts.append(hit["text"])
+                # Re-learning through recognition — restore to warm
+                _memory.restore_from_cold(hit["id"])
+
+    warm_texts = [h["text"] for h in good_warm]
+    return warm_texts, cold_texts, cold_delay_applied
 
 
 # ------------------------------------------------------------------
@@ -110,13 +181,18 @@ def _retrieve_memory_facts(query: str) -> list[str]:
 
 @app.get("/health")
 def health():
-    memory_count = _memory.count() if _memory else 0
+    warm_count = _memory.count() if _memory else 0
+    cold_count = _memory.count_cold() if _memory else 0
     return {
         "status": "ok",
         "backend": BACKEND,
         "model": MODEL_NAME,
         "memory_enabled": MEMORY_ENABLED,
-        "memory_facts": memory_count,
+        "memory_facts_warm": warm_count,
+        "memory_facts_cold": cold_count,
+        "dump_after_days": DUMP_AFTER_DAYS,
+        "recency_half_life_days": RECENCY_HALF_LIFE_DAYS,
+        "cold_recall_delay_seconds": COLD_RECALL_DELAY,
     }
 
 
@@ -124,8 +200,9 @@ def health():
 async def chat(body: ChatRequest, request: Request):
     _check_auth(request)
 
-    memory_facts = _retrieve_memory_facts(body.message)
-    prompt = _build_prompt(body.message, memory_facts)
+    warm_facts, cold_facts, cold_delay = await _retrieve_memory_facts(body.message)
+    all_facts = warm_facts + cold_facts
+    prompt = _build_prompt(body.message, all_facts)
 
     async with httpx.AsyncClient(timeout=120) as client:
         if BACKEND == "ollama":
@@ -134,14 +211,24 @@ async def chat(body: ChatRequest, request: Request):
                 json={"model": MODEL_NAME, "prompt": prompt, "stream": False},
             )
             r.raise_for_status()
-            return ChatResponse(response=r.json()["response"], memory_hits=memory_facts)
+            return ChatResponse(
+                response=r.json()["response"],
+                memory_hits=warm_facts,
+                cold_memory_hits=cold_facts,
+                cold_recall_delay_applied=cold_delay,
+            )
         else:
             r = await client.post(
                 f"{LLAMACPP_URL}/completion",
                 json={"prompt": prompt, "n_predict": 512, "stream": False},
             )
             r.raise_for_status()
-            return ChatResponse(response=r.json()["content"], memory_hits=memory_facts)
+            return ChatResponse(
+                response=r.json()["content"],
+                memory_hits=warm_facts,
+                cold_memory_hits=cold_facts,
+                cold_recall_delay_applied=cold_delay,
+            )
 
 
 @app.post("/learn", response_model=LearnResponse)
@@ -196,12 +283,41 @@ async def learn(body: LearnRequest, request: Request):
 
 @app.get("/memory", response_model=MemoryListResponse)
 def memory_list(request: Request):
-    """List all facts currently stored in memory."""
+    """List all facts currently stored in warm memory."""
     _check_auth(request)
     if _memory is None:
         return MemoryListResponse(count=0, facts=[])
     facts = _memory.list_all()
     return MemoryListResponse(count=len(facts), facts=facts)
+
+
+@app.get("/memory/cold", response_model=MemoryListResponse)
+def memory_cold_list(request: Request):
+    """List all facts currently in cold (dumped) storage."""
+    _check_auth(request)
+    if _memory is None:
+        return MemoryListResponse(count=0, facts=[])
+    facts = _memory.list_cold()
+    return MemoryListResponse(count=len(facts), facts=facts)
+
+
+@app.post("/memory/dump", response_model=MemoryDumpResponse)
+def memory_dump(request: Request):
+    """
+    Trigger a memory dump: move all warm memories not accessed for
+    ``dump_after_days`` to cold storage.
+
+    Run this periodically (e.g. via a cron job or scheduled task).
+    """
+    _check_auth(request)
+    if _memory is None:
+        raise HTTPException(status_code=503, detail="Memory is disabled in config.")
+    dumped = _memory.dump_stale()
+    return MemoryDumpResponse(
+        dumped=dumped,
+        warm_remaining=_memory.count(),
+        cold_total=_memory.count_cold(),
+    )
 
 
 @app.delete("/memory/{fact_id}")
@@ -220,8 +336,8 @@ def memory_delete(fact_id: str, request: Request):
 async def chat_stream(body: ChatRequest, request: Request):
     _check_auth(request)
 
-    memory_facts = _retrieve_memory_facts(body.message)
-    prompt = _build_prompt(body.message, memory_facts)
+    warm_facts, cold_facts, _cold_delay = await _retrieve_memory_facts(body.message)
+    prompt = _build_prompt(body.message, warm_facts + cold_facts)
 
     async def _stream_ollama() -> AsyncGenerator[str, None]:
         async with httpx.AsyncClient(timeout=120) as client:

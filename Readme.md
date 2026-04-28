@@ -174,8 +174,42 @@ curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
   -d '{"message": "What is the speed of light?"}'
 
-# Response includes which memories were injected:
-# { "response": "...", "memory_hits": ["The speed of light in a vacuum is 299,792 km/s."] }
+# Response includes which memories were injected and whether cold recall occurred:
+# {
+#   "response": "...",
+#   "memory_hits": ["The speed of light in a vacuum is 299,792 km/s."],
+#   "cold_memory_hits": [],
+#   "cold_recall_delay_applied": false
+# }
+```
+
+**Two-tier memory (warm / cold):**
+
+opensense models human long-term memory with two storage tiers:
+
+| Tier | Description |
+|---|---|
+| **Warm** | Recently-accessed facts. Scores are recency-weighted — a fact accessed 3 days ago scores at ~93 % of raw similarity; one not touched for 30 days scores at ~50 %. Retrieval is instant. |
+| **Cold** | Facts not accessed for `dump_after_days` (default **6 months**). Retrieval incurs a configurable async delay (`cold_recall_delay_seconds`, default 3 s) and a score penalty (`cold_score_penalty`, default 0.6×). A cold memory that is successfully recalled is automatically **restored to warm** — mirroring how re-exposure re-consolidates a forgotten memory. |
+
+```
+recency score  =  semantic_score × 2^(−age_days / half_life_days)
+cold score     =  semantic_score × cold_score_penalty
+```
+
+**Trigger a memory dump manually:**
+
+```bash
+# Move all warm facts not accessed for dump_after_days to cold storage
+curl -X POST http://localhost:8000/memory/dump
+
+# { "dumped": 12, "warm_remaining": 38, "cold_total": 12 }
+```
+
+**Inspect cold storage:**
+
+```bash
+curl http://localhost:8000/memory/cold
 ```
 
 **Authenticity gate — what gets rejected:**
@@ -218,21 +252,31 @@ api:
 
 memory:
   enabled: true               # set false to disable the learning feature entirely
-  persist_dir: "memory/db"   # ChromaDB storage path (created automatically)
+  persist_dir: "memory/db"   # ChromaDB storage path (warm/ and cold/ sub-dirs auto-created)
   top_k: 5                    # max facts retrieved per chat request
-  min_score: 0.45             # minimum cosine similarity to inject a fact (0–1)
+  min_score: 0.45             # minimum score to inject a fact (0–1)
   model_check: true           # run model-assisted authenticity check on new facts
   min_confidence: 0.6         # minimum confidence score to accept a fact (0–1)
+
+  # Two-tier memory
+  dump_after_days: 180        # move fact to cold after 6 months of no access
+  recency_half_life_days: 30  # warm score halves every 30 days without access
+  cold_score_penalty: 0.6     # penalise cold semantic scores (simulates imperfect recall)
+  cold_recall_delay_seconds: 3.0  # async delay when cold store is consulted
 ```
 
 | `memory` key | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Toggle the entire learning feature on/off |
-| `persist_dir` | `memory/db` | Where ChromaDB persists vectors on disk |
+| `persist_dir` | `memory/db` | Where ChromaDB persists vectors on disk (`warm/` and `cold/` sub-dirs created automatically) |
 | `top_k` | `5` | How many memories to inject into each chat prompt |
-| `min_score` | `0.45` | Cosine similarity threshold for memory retrieval |
+| `min_score` | `0.45` | Score threshold for injection (applied after recency decay for warm; after penalty for cold) |
 | `model_check` | `true` | Use the LLM to verify authenticity of new facts |
 | `min_confidence` | `0.6` | Combined heuristic+model score required to store a fact |
+| `dump_after_days` | `180` | Days of no access before a fact is moved to cold storage (≈ 6 months) |
+| `recency_half_life_days` | `30` | Warm score halves every this many days without access |
+| `cold_score_penalty` | `0.6` | Multiplier on semantic score for cold-tier results (simulates imperfect recall) |
+| `cold_recall_delay_seconds` | `3.0` | Async delay (seconds) added when cold store is consulted (simulates slow recognition) |
 
 ---
 
@@ -254,13 +298,13 @@ Use the `<|user|>` / `<|assistant|>` chat template when targeting an instruction
 - [x] Persistent vector memory (`/learn`, `/memory` endpoints)
 - [x] Two-layer authenticity gate (heuristics + model-assisted)
 - [x] Memory-augmented chat (auto-injects relevant facts into prompts)
+- [x] Memory decay / forgetting policy — two-tier warm/cold store with recency decay and slow-recall simulation
 - [ ] CLI tool (`opensense train`, `opensense run`, `opensense export`)
 - [ ] Web UI for dataset labelling and memory inspection
 - [ ] DPO / RLHF fine-tuning support
 - [ ] Docker Compose stack (training + API + Ollama)
 - [ ] Benchmark suite (MMLU, HellaSwag)
 - [ ] Support for vision models (LLaVA)
-- [ ] Memory decay / forgetting policy (TTL-based or confidence-weighted)
 - [ ] Multi-user memory namespacing
 
 ---
