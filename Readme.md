@@ -91,6 +91,41 @@ opensense/
 
 ---
 
+## Minimum System Requirements
+
+### Inference (running the API / chatting)
+
+| Model size | Quantization | RAM | VRAM (GPU, optional) |
+|---|---|---|---|
+| Phi-3 Mini 3.8B | Q4_K_M | 4 GB | 4 GB |
+| Mistral 7B / Llama 3 8B | Q4_K_M | 8 GB | 6 GB |
+| Llama 3 13B | Q4_K_M | 12 GB | 10 GB |
+
+> **Recommended minimum: 8 GB RAM** for a comfortable experience with a 7–8B model. The OS + FastAPI server + ChromaDB memory store consume ~2 GB on top of the model.
+
+### Fine-tuning (training)
+
+| Setup | RAM | VRAM |
+|---|---|---|
+| CPU only (slow, not recommended) | 16 GB | — |
+| GPU with LoRA — small model (Phi-3) | 8 GB | 8 GB |
+| GPU with LoRA — 7B model (recommended) | 16 GB | 16 GB |
+
+> **No GPU?** Run fine-tuning for free on [Google Colab](https://colab.research.google.com) (free T4 — 15 GB VRAM). Download the resulting GGUF and run inference locally.
+
+### Storage
+
+| Item | Typical size |
+|---|---|
+| Base model weights (7B) | 4–6 GB |
+| Fine-tuned checkpoint | 4–6 GB |
+| GGUF (Q4_K_M, 7B) | ~4 GB |
+| ChromaDB memory store | < 100 MB (grows with learned facts) |
+
+> Allocate at least **20 GB of free disk space** for a full pipeline run.
+
+---
+
 ## Quick Start
 
 ### Prerequisites
