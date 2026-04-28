@@ -26,3 +26,11 @@ api:
   llamacpp_url: "http://localhost:8080"
   model_name: "my-custom-model"
   api_key: ""                                     # leave empty to disable auth
+
+memory:
+  enabled: true                                   # set false to disable the learning feature entirely
+  persist_dir: "memory/db"                        # ChromaDB storage path
+  top_k: 5                                        # max facts retrieved per chat request
+  min_score: 0.45                                 # minimum cosine similarity to inject a fact (0–1)
+  model_check: true                               # run model-assisted authenticity check on new facts
+  min_confidence: 0.6                             # minimum confidence score to accept a fact (0–1)

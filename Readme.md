@@ -43,11 +43,14 @@ opensense/
 │   ├── base/
 │   └── fine_tuned/
 ├── gguf/                   # Converted GGUF files ready for Ollama / llama.cpp
-├── api/                    # Optional FastAPI wrapper around the running model
-│   ├── main.py
-│   └── requirements.txt
+├── api/                    # FastAPI wrapper around the running model
+│   ├── main.py             # Routes: /chat, /chat/stream, /learn, /memory, /health
+│   ├── memory.py           # ChromaDB-backed vector memory store
+│   └── authenticator.py    # Two-layer authenticity gate for new information
+├── memory/                 # Persistent ChromaDB vector storage (auto-created)
+│   └── db/
 ├── Modelfile               # Ollama Modelfile to build a named model image
-├── config.yaml             # Central config — model name, hyperparams, paths
+├── config.yaml             # Central config — model name, hyperparams, paths, memory
 ├── requirements.txt        # Python dependencies
 ├── BUILD_GUIDE.md          # Step-by-step build instructions
 ├── SCRUM_PLAN.md           # Scrum / sprint plan for the project
@@ -80,6 +83,15 @@ cd opensense
 ```bash
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
+```
+
+> **Windows (cmd):** `pip` may not be on your PATH. Use `python -m pip` instead:
+> ```cmd
+> python -m pip install -r requirements.txt
+> ```
+
+```bash
+# macOS / Linux
 pip install -r requirements.txt
 ```
 
@@ -132,6 +144,46 @@ uvicorn api.main:app --reload --port 8000
 # POST http://localhost:8000/chat  { "message": "Hello" }
 ```
 
+### 9 — Teach your model new information
+
+Once the API is running you can feed new facts into the model's persistent memory.
+Each submission passes a two-layer authenticity gate (heuristics + model-assisted check)
+before being stored. Future chat responses will automatically use relevant memories as context.
+
+```bash
+# Submit a fact
+curl -X POST http://localhost:8000/learn \
+  -H "Content-Type: application/json" \
+  -d '{"information": "The speed of light in a vacuum is 299,792 km/s.", "source": "user"}'
+
+# Response — fact accepted and stored:
+# { "stored": true, "fact_id": "a3f1...", "verdict": "accepted", "confidence": 0.92, "reason": "..." }
+
+# List all stored memories
+curl http://localhost:8000/memory
+
+# Remove a specific memory by its ID
+curl -X DELETE http://localhost:8000/memory/<fact_id>
+```
+
+**How memory augments chat:**
+
+```bash
+# Every /chat call automatically retrieves relevant memories and prepends them as context
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What is the speed of light?"}'
+
+# Response includes which memories were injected:
+# { "response": "...", "memory_hits": ["The speed of light in a vacuum is 299,792 km/s."] }
+```
+
+**Authenticity gate — what gets rejected:**
+- Text under 20 characters or over 4,000 characters
+- Mostly symbols / gibberish (> 60% non-alphanumeric)
+- Prompt-injection patterns (`ignore previous instructions`, jailbreak phrases, etc.)
+- Facts the model itself classifies as `FAKE` or implausible
+
 ---
 
 ## Configuration (`config.yaml`)
@@ -156,7 +208,31 @@ paths:
   base_model: "models/base"
   fine_tuned: "models/fine_tuned"
   gguf_out: "gguf"
+
+api:
+  backend: "ollama"           # "ollama" | "llamacpp"
+  ollama_url: "http://localhost:11434"
+  llamacpp_url: "http://localhost:8080"
+  model_name: "my-custom-model"
+  api_key: ""                 # leave empty to disable auth
+
+memory:
+  enabled: true               # set false to disable the learning feature entirely
+  persist_dir: "memory/db"   # ChromaDB storage path (created automatically)
+  top_k: 5                    # max facts retrieved per chat request
+  min_score: 0.45             # minimum cosine similarity to inject a fact (0–1)
+  model_check: true           # run model-assisted authenticity check on new facts
+  min_confidence: 0.6         # minimum confidence score to accept a fact (0–1)
 ```
+
+| `memory` key | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Toggle the entire learning feature on/off |
+| `persist_dir` | `memory/db` | Where ChromaDB persists vectors on disk |
+| `top_k` | `5` | How many memories to inject into each chat prompt |
+| `min_score` | `0.45` | Cosine similarity threshold for memory retrieval |
+| `model_check` | `true` | Use the LLM to verify authenticity of new facts |
+| `min_confidence` | `0.6` | Combined heuristic+model score required to store a fact |
 
 ---
 
@@ -175,12 +251,45 @@ Use the `<|user|>` / `<|assistant|>` chat template when targeting an instruction
 
 ## Roadmap
 
+- [x] Persistent vector memory (`/learn`, `/memory` endpoints)
+- [x] Two-layer authenticity gate (heuristics + model-assisted)
+- [x] Memory-augmented chat (auto-injects relevant facts into prompts)
 - [ ] CLI tool (`opensense train`, `opensense run`, `opensense export`)
-- [ ] Web UI for dataset labelling
+- [ ] Web UI for dataset labelling and memory inspection
 - [ ] DPO / RLHF fine-tuning support
 - [ ] Docker Compose stack (training + API + Ollama)
 - [ ] Benchmark suite (MMLU, HellaSwag)
 - [ ] Support for vision models (LLaVA)
+- [ ] Memory decay / forgetting policy (TTL-based or confidence-weighted)
+- [ ] Multi-user memory namespacing
+
+---
+
+## Open for Collaboration
+
+opensense welcomes contributors of all experience levels. Whether you want to fix a bug,
+add a feature from the roadmap, improve documentation, or propose a new idea — you are
+very welcome here.
+
+**Ways to get involved:**
+
+| Area | What's needed |
+|---|---|
+| Core pipeline | Fine-tuning improvements, new base model support |
+| Learning feature | Memory decay policies, multi-user namespacing, UI for memory inspection |
+| Tooling | CLI (`opensense train / run / export`), Docker Compose stack |
+| Evaluation | Benchmark integration (MMLU, HellaSwag, custom evals) |
+| Documentation | Tutorials, example notebooks, translated guides |
+| Testing | Unit and integration test coverage |
+
+**How to contribute:**
+
+1. Browse [open issues](https://github.com/your-org/opensense/issues) or open a new one to discuss your idea
+2. Fork the repo and create a feature branch (`git checkout -b feat/my-feature`)
+3. Make your changes and add tests where applicable
+4. Open a pull request — describe what you changed and why
+
+No contribution is too small. Typo fixes and doc improvements are just as valued as new features.
 
 ---
 
