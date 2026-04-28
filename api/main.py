@@ -24,6 +24,13 @@ from pydantic import BaseModel
 
 from api.authenticator import authenticate
 from api.memory import MemoryStore
+from api.nlp import NLPProcessor, StyleProfile
+from api.search import (
+    SearchOutcome,
+    build_search_context_block,
+    should_ground,
+    web_search,
+)
 
 CONFIG_PATH = "config.yaml"
 
@@ -52,20 +59,40 @@ RECENCY_HALF_LIFE_DAYS = int(_mem_cfg.get("recency_half_life_days", 30))
 COLD_SCORE_PENALTY = float(_mem_cfg.get("cold_score_penalty", 0.6))
 COLD_RECALL_DELAY = float(_mem_cfg.get("cold_recall_delay_seconds", 3.0))
 
+_nlp_cfg = _config.get("nlp", {})
+NLP_ENABLED = _nlp_cfg.get("enabled", True)
+NLP_SPELL_CHECK = _nlp_cfg.get("spell_check", True)
+NLP_STYLE_ADAPT = _nlp_cfg.get("style_adapt", True)
+NLP_INPUT_NORMALIZE = _nlp_cfg.get("input_normalize", True)
+
+_search_cfg = _config.get("web_search", {})
+SEARCH_ENABLED = _search_cfg.get("enabled", False)
+SEARCH_PROVIDER = _search_cfg.get("provider", "duckduckgo")
+SEARCH_API_KEY = _search_cfg.get("api_key", "") or os.getenv("OPENSENSE_SEARCH_KEY", "")
+SEARCH_MAX_RESULTS = int(_search_cfg.get("max_results", 5))
+SEARCH_MODE = _search_cfg.get("mode", "auto")   # "always" | "auto" | "never"
+
 app = FastAPI(title="opensense API", version="0.1.0")
 
 _memory: MemoryStore | None = None
+_nlp: NLPProcessor | None = None
 
 
 @app.on_event("startup")
 async def _startup():
-    global _memory
+    global _memory, _nlp
     if MEMORY_ENABLED:
         _memory = MemoryStore(
             persist_dir=MEMORY_DIR,
             dump_after_days=DUMP_AFTER_DAYS,
             recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
             cold_score_penalty=COLD_SCORE_PENALTY,
+        )
+    if NLP_ENABLED:
+        _nlp = NLPProcessor(
+            spell_check=NLP_SPELL_CHECK,
+            style_adapt=NLP_STYLE_ADAPT,
+            input_normalize=NLP_INPUT_NORMALIZE,
         )
 
 
@@ -86,6 +113,13 @@ class ChatResponse(BaseModel):
     memory_hits: list[str] = []        # warm facts injected (for transparency)
     cold_memory_hits: list[str] = []   # cold facts recalled after delay (for transparency)
     cold_recall_delay_applied: bool = False
+    web_sources: list[str] = []        # URLs from web search results (for transparency)
+    web_search_query: str = ""         # the query that was run against the web
+    # NLP transparency fields
+    nlp_original_input: str = ""       # raw user message before NLP processing
+    nlp_corrected_input: str = ""      # AI-friendly version sent to the model
+    nlp_changes: list[str] = []        # list of transformations applied to the input
+    nlp_style: str = ""                # detected style summary  (e.g. "casual/simple/friendly")
 
 
 class LearnRequest(BaseModel):
@@ -116,15 +150,29 @@ class MemoryDumpResponse(BaseModel):
 # Helpers
 # ------------------------------------------------------------------
 
-def _build_prompt(message: str, memory_facts: list[str]) -> str:
-    """Prepend remembered facts to the user message as context."""
-    if not memory_facts:
+def _build_prompt(
+    message: str,
+    memory_facts: list[str],
+    search_outcome: SearchOutcome | None = None,
+    style_instruction: str = "",
+) -> str:
+    """Prepend remembered facts, web search results, and style guidance to the user message."""
+    sections: list[str] = []
+
+    if memory_facts:
+        facts_block = "\n".join(f"- {f}" for f in memory_facts)
+        sections.append(f"[Remembered context]\n{facts_block}")
+
+    if search_outcome and search_outcome.results:
+        sections.append(build_search_context_block(search_outcome))
+
+    if style_instruction:
+        sections.append(f"[Response style]\n{style_instruction}")
+
+    if not sections:
         return message
-    facts_block = "\n".join(f"- {f}" for f in memory_facts)
-    return (
-        f"[Remembered context]\n{facts_block}\n\n"
-        f"[User message]\n{message}"
-    )
+
+    return "\n\n".join(sections) + f"\n\n[User message]\n{message}"
 
 
 async def _retrieve_memory_facts(
@@ -193,6 +241,10 @@ def health():
         "dump_after_days": DUMP_AFTER_DAYS,
         "recency_half_life_days": RECENCY_HALF_LIFE_DAYS,
         "cold_recall_delay_seconds": COLD_RECALL_DELAY,
+        "web_search_enabled": SEARCH_ENABLED,
+        "web_search_provider": SEARCH_PROVIDER,
+        "web_search_mode": SEARCH_MODE,
+        "web_search_max_results": SEARCH_MAX_RESULTS,
     }
 
 
@@ -200,9 +252,43 @@ def health():
 async def chat(body: ChatRequest, request: Request):
     _check_auth(request)
 
-    warm_facts, cold_facts, cold_delay = await _retrieve_memory_facts(body.message)
+    # --- NLP: process user input ---
+    nlp_profile: StyleProfile | None = None
+    effective_message = body.message
+    style_instruction = ""
+    if _nlp is not None:
+        nlp_profile = _nlp.process_input(body.message)
+        effective_message = nlp_profile.corrected_text
+        style_instruction = _nlp.build_style_instruction(nlp_profile)
+
+    warm_facts, cold_facts, cold_delay = await _retrieve_memory_facts(effective_message)
     all_facts = warm_facts + cold_facts
-    prompt = _build_prompt(body.message, all_facts)
+
+    # --- Web search grounding (Gemini-style) ---
+    search_outcome: SearchOutcome | None = None
+    if SEARCH_ENABLED and should_ground(effective_message, SEARCH_MODE):
+        search_outcome = await web_search(
+            effective_message,
+            provider=SEARCH_PROVIDER,
+            api_key=SEARCH_API_KEY,
+            max_results=SEARCH_MAX_RESULTS,
+        )
+
+    prompt = _build_prompt(effective_message, all_facts, search_outcome, style_instruction)
+
+    web_sources = (
+        [r.url for r in search_outcome.results] if search_outcome and search_outcome.results else []
+    )
+    web_query = search_outcome.query_run if search_outcome else ""
+
+    # Build NLP transparency fields.
+    nlp_original = body.message
+    nlp_corrected = effective_message
+    nlp_changes = nlp_profile.changes_made if nlp_profile else []
+    nlp_style_summary = (
+        f"{nlp_profile.formality}/{nlp_profile.complexity}/{nlp_profile.tone}"
+        if nlp_profile else ""
+    )
 
     async with httpx.AsyncClient(timeout=120) as client:
         if BACKEND == "ollama":
@@ -211,11 +297,24 @@ async def chat(body: ChatRequest, request: Request):
                 json={"model": MODEL_NAME, "prompt": prompt, "stream": False},
             )
             r.raise_for_status()
+            raw_response = r.json()["response"]
+            # --- NLP: adapt model output to user's style ---
+            final_response = (
+                _nlp.adapt_output(raw_response, nlp_profile)
+                if _nlp is not None and nlp_profile is not None
+                else raw_response
+            )
             return ChatResponse(
-                response=r.json()["response"],
+                response=final_response,
                 memory_hits=warm_facts,
                 cold_memory_hits=cold_facts,
                 cold_recall_delay_applied=cold_delay,
+                web_sources=web_sources,
+                web_search_query=web_query,
+                nlp_original_input=nlp_original,
+                nlp_corrected_input=nlp_corrected,
+                nlp_changes=nlp_changes,
+                nlp_style=nlp_style_summary,
             )
         else:
             r = await client.post(
@@ -223,11 +322,24 @@ async def chat(body: ChatRequest, request: Request):
                 json={"prompt": prompt, "n_predict": 512, "stream": False},
             )
             r.raise_for_status()
+            raw_response = r.json()["content"]
+            # --- NLP: adapt model output to user's style ---
+            final_response = (
+                _nlp.adapt_output(raw_response, nlp_profile)
+                if _nlp is not None and nlp_profile is not None
+                else raw_response
+            )
             return ChatResponse(
-                response=r.json()["content"],
+                response=final_response,
                 memory_hits=warm_facts,
                 cold_memory_hits=cold_facts,
                 cold_recall_delay_applied=cold_delay,
+                web_sources=web_sources,
+                web_search_query=web_query,
+                nlp_original_input=nlp_original,
+                nlp_corrected_input=nlp_corrected,
+                nlp_changes=nlp_changes,
+                nlp_style=nlp_style_summary,
             )
 
 
@@ -336,8 +448,27 @@ def memory_delete(fact_id: str, request: Request):
 async def chat_stream(body: ChatRequest, request: Request):
     _check_auth(request)
 
-    warm_facts, cold_facts, _cold_delay = await _retrieve_memory_facts(body.message)
-    prompt = _build_prompt(body.message, warm_facts + cold_facts)
+    # --- NLP: process user input (same pipeline as non-streaming /chat) ---
+    effective_message = body.message
+    style_instruction = ""
+    if _nlp is not None:
+        nlp_profile = _nlp.process_input(body.message)
+        effective_message = nlp_profile.corrected_text
+        style_instruction = _nlp.build_style_instruction(nlp_profile)
+
+    warm_facts, cold_facts, _cold_delay = await _retrieve_memory_facts(effective_message)
+
+    # --- Web search grounding (streaming) ---
+    search_outcome: SearchOutcome | None = None
+    if SEARCH_ENABLED and should_ground(effective_message, SEARCH_MODE):
+        search_outcome = await web_search(
+            effective_message,
+            provider=SEARCH_PROVIDER,
+            api_key=SEARCH_API_KEY,
+            max_results=SEARCH_MAX_RESULTS,
+        )
+
+    prompt = _build_prompt(effective_message, warm_facts + cold_facts, search_outcome, style_instruction)
 
     async def _stream_ollama() -> AsyncGenerator[str, None]:
         async with httpx.AsyncClient(timeout=120) as client:

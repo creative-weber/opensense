@@ -34,3 +34,16 @@ memory:
   min_score: 0.45                                 # minimum cosine similarity to inject a fact (0–1)
   model_check: true                               # run model-assisted authenticity check on new facts
   min_confidence: 0.6                             # minimum confidence score to accept a fact (0–1)
+
+web_search:
+  enabled: false                                  # set true to enable Gemini-style web grounding
+  provider: "duckduckgo"                          # "duckduckgo" (no key needed) | "brave" | "serpapi"
+  api_key: ""                                     # required for brave / serpapi; or set OPENSENSE_SEARCH_KEY env var
+  max_results: 5                                  # how many web snippets to inject into the prompt
+  mode: "auto"                                    # "auto" (only factual/current queries) | "always" | "never"
+
+nlp:
+  enabled: true                                   # master switch — set false to bypass all NLP processing
+  spell_check: true                               # correct spelling in user input (requires pyspellchecker)
+  style_adapt: true                               # detect user style and inject response-style instruction into prompt
+  input_normalize: true                           # expand chat-speak (u→you, gonna→going to, etc.) and fix punctuation

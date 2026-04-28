@@ -38,3 +38,6 @@ Thumbs.db
 
 # TensorBoard
 runs/
+
+# Local planning notes
+README_IMPROVEMENT_IDEAS.md

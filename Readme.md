@@ -18,6 +18,37 @@ You own the full pipeline — data, weights, and inference.
 
 ---
 
+## Save Your AI Credits — Stop Paying Per Token
+
+Every call to GPT-4, Claude, or Gemini burns credits you can never get back.
+Building a custom model from scratch costs weeks of engineering time on top of that.
+
+**opensense is the shortcut.** Clone the repo, drop in your data, and you have a
+fine-tuned model running locally in a few hours — with zero ongoing API costs.
+
+| Approach | Setup time | Monthly cost | Data privacy | Customisable |
+|---|---|---|---|---|
+| Hosted API (OpenAI / Anthropic) | Minutes | $20 – $500+ | ✗ Leaves your servers | Limited (prompting only) |
+| Build from scratch | Weeks – months | Engineering salary | ✓ | ✓ |
+| **opensense starter kit** | **Hours** | **$0 after hardware** | **✓ Fully local** | **✓ Full fine-tuning** |
+
+> **One-time effort, permanent savings.** After the initial fine-tune you own the weights
+> and run inference on your own machine — no rate limits, no vendor lock-in, no bill at
+> the end of the month.
+
+---
+
+## Why opensense?
+
+- **No boilerplate.** The data pipeline, training loop, GGUF export, and API are already wired up. You bring your dataset; opensense does the rest.
+- **Production-ready memory.** Built-in warm/cold vector memory means your model remembers facts across sessions — without you writing a single line of RAG code.
+- **Web grounding included.** Gemini-style thinking with DuckDuckGo, Brave, or SerpAPI so your model can answer with up-to-date information out of the box.
+- **NLP pre/post processing.** Automatic input normalisation, spell correction, style detection, and output cleanup — features you'd otherwise spend days building.
+- **Runs anywhere.** Ollama for local dev, llama.cpp for edge devices, Docker for production — pick your runtime, keep the same API.
+- **Fully open-source.** MIT licence. No hidden tiers, no "pro" features behind a paywall.
+
+---
+
 ## Supported Runtimes
 
 | Runtime | Description |
@@ -46,6 +77,7 @@ opensense/
 ├── api/                    # FastAPI wrapper around the running model
 │   ├── main.py             # Routes: /chat, /chat/stream, /learn, /memory, /health
 │   ├── memory.py           # ChromaDB-backed vector memory store
+│   ├── search.py           # Web search grounding (Gemini-style thinking feature)
 │   └── authenticator.py    # Two-layer authenticity gate for new information
 ├── memory/                 # Persistent ChromaDB vector storage (auto-created)
 │   └── db/
@@ -220,7 +252,158 @@ curl http://localhost:8000/memory/cold
 
 ---
 
-## Configuration (`config.yaml`)
+## Natural Language Processing (Input & Output)
+
+opensense includes a built-in **NLP pipeline** that runs on every `/chat` request to clean up
+user input before it reaches the model and to shape the model's reply to match the user's
+own communication style.
+
+### Input pipeline
+
+| Step | What it does |
+|---|---|
+| **Informal expansion** | Converts chat-speak abbreviations to standard English: `u → you`, `gonna → going to`, `idk → I don't know`, `btw → by the way`, etc. |
+| **Punctuation normalisation** | Collapses repeated punctuation (`!!!→!`, `???→?`) and converts shouted ALL-CAPS words to sentence case. |
+| **Spell correction** | Uses `pyspellchecker` (pure Python, offline) to fix misspellings in lowercase tokens, while preserving proper nouns, acronyms, and technical terms (`api`, `json`, `llm`, etc.). |
+| **Style detection** | Classifies the message as *casual / neutral / formal* (formality), *simple / moderate / technical* (complexity), and *friendly / neutral / professional* (tone). |
+
+### Output pipeline
+
+| Step | What it does |
+|---|---|
+| **Style instruction injection** | Appends a `[Response style]` block to the prompt so the model mirrors the detected formality and complexity in its reply — no post-hoc rewriting needed. |
+| **Filler opener removal** | Strips model-generated filler openers like *"Certainly!"*, *"Great question!"*, *"I'd be happy to help"* that add no value. |
+| **Stiff-closer softening** | For casual users, replaces overly formal closers (*"Please do not hesitate to contact me"*) with natural alternatives. |
+
+### Prompt context order (with NLP enabled)
+
+```
+[Remembered context]       ← warm/cold memory facts (if any)
+
+[Web search results]       ← live web snippets (if any)
+
+[Response style]           ← NLP-generated style instruction
+Reply in a friendly, conversational tone — avoid stiff or overly formal language.
+Use plain, everyday language; avoid technical jargon.
+Answer the question directly first, then provide supporting detail or context.
+
+[User message]
+<AI-friendly version of the user's corrected input>
+```
+
+### Enable / disable
+
+```yaml
+nlp:
+  enabled: true           # master switch — set false to bypass all NLP processing
+  spell_check: true       # correct spelling in user input
+  style_adapt: true       # inject response-style instruction + clean up output
+  input_normalize: true   # expand chat-speak and fix punctuation
+```
+
+### Transparency fields in `/chat` response
+
+The `/chat` response includes NLP metadata so you can see exactly what the pipeline changed:
+
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "hey can u explan how garbge collection wrks in python"}'
+
+# {
+#   "response": "Garbage collection in Python works through...",
+#   "nlp_original_input": "hey can u explan how garbge collection wrks in python",
+#   "nlp_corrected_input": "hey can you explain how garbage collection works in python",
+#   "nlp_changes": ["informal expansion", "spell: 'explan' → 'explain'", "spell: 'garbge' → 'garbage'", "spell: 'wrks' → 'works'"],
+#   "nlp_style": "casual/moderate/friendly",
+#   ...
+# }
+```
+
+> **Note:** `pyspellchecker` must be installed (`pip install pyspellchecker`) for spell correction.
+> If the package is missing, spell-checking degrades gracefully — all other NLP steps still run.
+
+---
+
+## Web Search Grounding (Thinking Feature)
+
+opensense includes a **Gemini-style web grounding** feature. When enabled, the API
+searches the web for trusted, up-to-date sources before the model replies — injecting
+the top results as context so the model can answer with current, source-backed information.
+
+### Enable it
+
+Set `web_search.enabled: true` in `config.yaml` (off by default):
+
+```yaml
+web_search:
+  enabled: true
+  provider: "duckduckgo"   # no API key needed
+  max_results: 5
+  mode: "auto"             # only fires for factual / time-sensitive queries
+```
+
+### How it works
+
+1. A `/chat` request arrives.
+2. If `mode: "auto"`, opensense checks whether the query looks factual or time-sensitive
+   (keywords like `latest`, `current`, `price`, `who is`, `news`, years, etc.).
+3. If grounding is triggered, the top `max_results` web snippets are fetched.
+4. The snippets are prepended to the prompt as a numbered `[Web search results]` block.
+5. The LLM reads the snippets alongside its own knowledge and any recalled memories before replying.
+6. The response includes `web_sources` (list of URLs) and `web_search_query` for full transparency.
+
+### Prompt context order
+
+```
+[Remembered context]       ← warm/cold memory facts (if any)
+
+[Web search results — DuckDuckGo | query: "..."]   ← live web snippets (if any)
+1. Title — https://source.com
+   Snippet text...
+...
+
+[User message]
+Your question here
+```
+
+### Example
+
+```bash
+# With web_search.enabled: true
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What is the latest version of Python?"}'
+
+# Response:
+# {
+#   "response": "The latest stable release is Python 3.13...",
+#   "memory_hits": [],
+#   "cold_memory_hits": [],
+#   "cold_recall_delay_applied": false,
+#   "web_sources": ["https://www.python.org/downloads/", ...],
+#   "web_search_query": "What is the latest version of Python?"
+# }
+```
+
+### Search providers
+
+| Provider | API key required | Notes |
+|---|---|---|
+| `duckduckgo` | No | Default. Uses DuckDuckGo Lite HTML — no sign-up needed. |
+| `brave` | Yes (free tier) | [Brave Search API](https://api.search.brave.com). Set `api_key` or `OPENSENSE_SEARCH_KEY` env var. |
+| `serpapi` | Yes (free tier) | [SerpAPI](https://serpapi.com) Google Search. Set `api_key` or `OPENSENSE_SEARCH_KEY` env var. |
+
+### Search modes
+
+| Mode | Behaviour |
+|---|---|
+| `auto` | Only fires for queries that look factual or time-sensitive (recommended). |
+| `always` | Grounds every single query unconditionally. |
+| `never` | Disables grounding even if `enabled: true` (useful for testing). |
+
+> **Health check** — `GET /health` reports `web_search_enabled`, `web_search_provider`,
+> `web_search_mode`, and `web_search_max_results` so you can verify the feature is active.
 
 ```yaml
 model:
@@ -263,6 +446,13 @@ memory:
   recency_half_life_days: 30  # warm score halves every 30 days without access
   cold_score_penalty: 0.6     # penalise cold semantic scores (simulates imperfect recall)
   cold_recall_delay_seconds: 3.0  # async delay when cold store is consulted
+
+web_search:
+  enabled: false              # set true to enable Gemini-style web grounding
+  provider: "duckduckgo"      # "duckduckgo" | "brave" | "serpapi"
+  api_key: ""                 # required for brave / serpapi; or set OPENSENSE_SEARCH_KEY env var
+  max_results: 5              # web snippets injected into the prompt
+  mode: "auto"                # "auto" | "always" | "never"
 ```
 
 | `memory` key | Default | Description |
@@ -277,6 +467,16 @@ memory:
 | `recency_half_life_days` | `30` | Warm score halves every this many days without access |
 | `cold_score_penalty` | `0.6` | Multiplier on semantic score for cold-tier results (simulates imperfect recall) |
 | `cold_recall_delay_seconds` | `3.0` | Async delay (seconds) added when cold store is consulted (simulates slow recognition) |
+
+**`web_search` keys:**
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Toggle web search grounding on/off |
+| `provider` | `duckduckgo` | Search backend: `duckduckgo`, `brave`, or `serpapi` |
+| `api_key` | `""` | API key for Brave / SerpAPI (or set `OPENSENSE_SEARCH_KEY` env var) |
+| `max_results` | `5` | Number of web snippets injected into the prompt |
+| `mode` | `auto` | `auto` fires only for factual queries; `always` grounds everything; `never` disables |
 
 ---
 
@@ -299,6 +499,8 @@ Use the `<|user|>` / `<|assistant|>` chat template when targeting an instruction
 - [x] Two-layer authenticity gate (heuristics + model-assisted)
 - [x] Memory-augmented chat (auto-injects relevant facts into prompts)
 - [x] Memory decay / forgetting policy — two-tier warm/cold store with recency decay and slow-recall simulation
+- [x] Web search grounding — Gemini-style thinking feature (DuckDuckGo / Brave / SerpAPI)
+- [x] Natural language processing — input normalisation, spell correction, style detection, output adaptation
 - [ ] CLI tool (`opensense train`, `opensense run`, `opensense export`)
 - [ ] Web UI for dataset labelling and memory inspection
 - [ ] DPO / RLHF fine-tuning support
@@ -321,6 +523,7 @@ very welcome here.
 |---|---|
 | Core pipeline | Fine-tuning improvements, new base model support |
 | Learning feature | Memory decay policies, multi-user namespacing, UI for memory inspection |
+| Web grounding | Result re-ranking, source trust scoring, citation formatting |
 | Tooling | CLI (`opensense train / run / export`), Docker Compose stack |
 | Evaluation | Benchmark integration (MMLU, HellaSwag, custom evals) |
 | Documentation | Tutorials, example notebooks, translated guides |
