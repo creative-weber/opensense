@@ -140,12 +140,20 @@ opensense/
 
 ### 1 — Clone the repo
 
+> **Required**
+
 ```bash
 git clone https://github.com/your-org/opensense.git
 cd opensense
 ```
 
+**Why:** Downloads all the scripts, config files, and API code to your machine. Nothing works without this step.
+
+---
+
 ### 2 — Install Python dependencies
+
+> **Required**
 
 ```bash
 python -m venv .venv
@@ -162,54 +170,144 @@ source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+**Why:** opensense depends on several Python packages — `transformers`, `peft`, `huggingface_hub`, `fastapi`, `chromadb`, `torch`, and others. Installing them into a virtual environment (`.venv`) keeps your global Python installation clean and avoids version conflicts with other projects on your machine.
+
+---
+
 ### 3 — Download a base model
 
-Edit `config.yaml` to choose your base model, then run:
+> **Required** (unless you already have a local model)
+
+Edit `config.yaml` to choose your base model:
+
+```yaml
+model:
+  base: "microsoft/Phi-3-mini-4k-instruct"   # recommended — no sign-up needed, 3.8B
+  # base: "meta-llama/Meta-Llama-3-8B-Instruct"  # requires HuggingFace access approval
+```
+
+Then run:
 
 ```bash
 python scripts/prepare_data.py --download-base
 ```
 
+**Why:** You need a pre-trained base model to fine-tune on top of. Training a model from random weights would require millions of GPU-hours and terabytes of data. By starting from a base model (e.g. Phi-3, Mistral, Llama 3), you inherit general language understanding and only teach it your specific domain — this is what makes fine-tuning affordable.
+
+> **Note:** Some models (e.g. Llama 3) are **gated** on HuggingFace and require you to accept Meta's licence before downloading. Visit the model page, click "Request access", then run `huggingface-cli login` with your token. Phi-3 and Mistral have no such restriction.
+
+---
+
 ### 4 — Prepare your dataset
 
-Place raw files in `data/raw/` (JSONL format, one `{"prompt": "...", "response": "..."}` per line), then:
+> **Required for fine-tuning** · Optional if you only want to run the base model as-is
+
+Place raw files in `data/raw/` in JSONL format — one JSON object per line:
+
+```jsonl
+{"prompt": "What is your return policy?", "response": "You can return any item within 30 days..."}
+{"prompt": "How do I reset my password?", "response": "Go to Settings → Security → Reset password..."}
+```
+
+Then run:
 
 ```bash
 python scripts/prepare_data.py
 ```
 
+**Why:** Raw text cannot be fed directly into a training loop. This script:
+- Validates that every line has the required `prompt` / `response` keys
+- Applies the correct **chat template** for your chosen base model (e.g. wraps text in `<|user|>` / `<|assistant|>` tokens that the model was originally trained with)
+- Tokenises the text and splits it into training and validation sets
+- Saves the processed output to `data/processed/` ready for the fine-tuner
+
+Without this step, the training script will have no data to learn from. The quality of your dataset is the single biggest factor in the quality of your fine-tuned model — more clean, relevant examples = better results.
+
+> **Tip:** Even 100–200 high-quality prompt/response pairs can produce a noticeably specialised model. Start small, evaluate, then scale up.
+
+---
+
 ### 5 — Fine-tune
+
+> **Required for a custom model** · Skip if you want to use the base model unchanged
 
 ```bash
 python scripts/fine_tune.py
 ```
 
+**Why:** This is the step that actually teaches the base model your domain. It uses **LoRA** (Low-Rank Adaptation) — a parameter-efficient technique that only updates a small set of adapter weights rather than retraining the entire model. This means:
+- Training takes hours instead of weeks
+- You need far less VRAM (8–16 GB instead of 80+ GB)
+- The base model weights stay unchanged — you can swap adapters without re-downloading
+
+The fine-tuned adapter is saved to `models/fine_tuned/`.
+
+> **No GPU?** Run this step on [Google Colab](https://colab.research.google.com) for free (T4 GPU, 15 GB VRAM). Upload your `data/processed/` folder, run the script, then download the checkpoint.
+
+---
+
 ### 6 — Convert to GGUF
+
+> **Required to run with Ollama or llama.cpp** · Skip if you only use the HuggingFace transformers backend
 
 ```bash
 python scripts/convert_to_gguf.py
 python scripts/quantize.py --quant Q4_K_M   # recommended for most hardware
 ```
 
+**Why:** HuggingFace model checkpoints are stored in `.safetensors` format, which requires PyTorch and significant RAM to load. **GGUF** is a compact, self-contained binary format designed for efficient CPU/GPU inference:
+- Loads faster with no Python dependencies at runtime
+- Supports **quantization** — compressing weights from 16-bit floats to 4-bit integers, reducing a 7B model from ~14 GB to ~4 GB with minimal quality loss
+- Required by both Ollama and llama.cpp
+
+`Q4_K_M` is the recommended quantization level — good balance of size, speed, and quality. Use `Q8_0` if you have plenty of RAM and want higher accuracy.
+
+---
+
 ### 7a — Run with Ollama
+
+> **Required** (choose either 7a or 7b)
 
 ```bash
 ollama create my-model -f Modelfile
 ollama run my-model
 ```
 
+**Why:** Ollama wraps your GGUF file in a named model image (similar to a Docker image) and starts a local REST server on `http://localhost:11434`. This is the easiest way to get your model running — one command to create, one command to chat. Best for local development and quick demos.
+
+---
+
 ### 7b — Run with llama.cpp
+
+> **Required** (choose either 7a or 7b)
 
 ```bash
 ./llama.cpp/main -m gguf/my-model-Q4_K_M.gguf -p "Hello, who are you?"
 ```
 
-### 8 — (Optional) Start the REST API
+**Why:** llama.cpp is a lightweight C++ inference engine with no Python runtime required. It is more suitable for production self-hosting and edge devices where you want minimal dependencies and maximum control over memory and thread usage.
+
+---
+
+### 8 — Start the REST API
+
+> **Optional** — needed for memory, web search, NLP features, and programmatic access
 
 ```bash
 uvicorn api.main:app --reload --port 8000
 # POST http://localhost:8000/chat  { "message": "Hello" }
 ```
+
+**Why:** Steps 7a/7b give you a raw model you can chat with interactively. The REST API layer adds everything else:
+- `/chat` — structured JSON requests and responses, compatible with any HTTP client
+- `/chat/stream` — streaming token-by-token responses for real-time UIs
+- `/learn` — teach the model new facts at runtime (no retraining needed)
+- `/memory` — inspect, add, and delete stored facts
+- `/health` — verify the server, model, and memory store are all running
+
+If you are building an application or want persistent memory and web grounding, you need this step. If you just want to chat locally, you can skip it.
+
+---
 
 ### 9 — Teach your model new information
 
